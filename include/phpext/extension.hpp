@@ -115,7 +115,7 @@ protected:
     template<auto func, typename A = arg_names_empty_t>
     static void reg_function(const char *name) {
         using FT = cpp_func_traits<decltype(func), A>;
-        auto zif_handler = wrap_non_inst_meth<FT, func>();
+        auto zif_handler = wrap_free_function<FT, func>();
         const auto arginfo = php_arg_info_holder<FT>::as_ziai_array();
         zend_function_entry zfe = {
             name, zif_handler, arginfo, FT::arg_traits::max_args, 0

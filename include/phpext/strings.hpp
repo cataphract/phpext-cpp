@@ -6,6 +6,31 @@
 
 namespace zend {
 
+template<typename Char, Char ... Cs>
+class ct_string : std::integer_sequence<Char, Cs...> {
+    constexpr static const Char value[] {Cs..., 0};
+public:
+    constexpr ct_string() noexcept {}
+    static constexpr size_t length() noexcept{
+        return sizeof...(Cs);
+    }
+    constexpr operator const Char *() const noexcept {
+        return value;
+    }
+};
+
+#ifdef __clang__
+#   pragma clang diagnostic push
+#   pragma clang diagnostic ignored "-Wgnu-string-literal-operator-template"
+#endif
+template<typename Char, Char ... Cs>
+constexpr auto operator"" _cs() -> ct_string<Char, Cs ...> {
+    return {};
+}
+#ifdef __clang__
+#   pragma clang diagnostic pop
+#endif
+
 static constexpr zend_ulong ze_hash(const char *str, size_t len)
 {
     zend_ulong hash = Z_UL(5381);

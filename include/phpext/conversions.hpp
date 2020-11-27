@@ -5,7 +5,9 @@
 #include <tuple>
 #include <functional>
 #include <php.h>
+#include <utility>
 #include "zmm.hpp"
+#include "strings.hpp"
 
 namespace zend {
 
@@ -118,6 +120,25 @@ struct cpp_func_traits<R (C::*)(Args...), ArgNames>
     using is_void = std::false_type;
     using ret_type = R;
 };
+#define GEN_MEMB_FUNC_VARIANT(qualifiers)                                      \
+    template<typename ArgNames, typename C, typename R, typename... Args>      \
+    struct cpp_func_traits<R (C::*)(Args...) qualifiers, ArgNames>             \
+        : cpp_func_traits<R (C::*)(Args...), ArgNames> {                       \
+        using func_type = R (C::*)(Args...) qualifiers;                        \
+    }
+// ignore volatile qualifier
+GEN_MEMB_FUNC_VARIANT(const);
+GEN_MEMB_FUNC_VARIANT(&);
+GEN_MEMB_FUNC_VARIANT(&&);
+GEN_MEMB_FUNC_VARIANT(const &);
+GEN_MEMB_FUNC_VARIANT(const &&);
+GEN_MEMB_FUNC_VARIANT(noexcept);
+GEN_MEMB_FUNC_VARIANT(const noexcept);
+GEN_MEMB_FUNC_VARIANT(& noexcept);
+GEN_MEMB_FUNC_VARIANT(&& noexcept);
+GEN_MEMB_FUNC_VARIANT(const & noexcept);
+GEN_MEMB_FUNC_VARIANT(const && noexcept);
+#undef GEN_MEMB_FUNC_VARIANT
 template<typename ArgNames, typename C, typename... Args>
 struct cpp_func_traits<void (C::*)(Args...), ArgNames>
     : cpp_func_memb<ArgNames, Args...> {
@@ -125,6 +146,24 @@ struct cpp_func_traits<void (C::*)(Args...), ArgNames>
     using is_void = std::true_type;
     using ret_type = void;
 };
+#define GEN_MEMB_FUNC_VARIANT(qualifiers)                                      \
+    template<typename ArgNames, typename C, typename... Args>                  \
+    struct cpp_func_traits<void (C::*)(Args...) qualifiers, ArgNames>          \
+        : cpp_func_traits<void (C::*)(Args...), ArgNames> {                    \
+        using func_type = void (C::*)(Args...) qualifiers;                     \
+    }
+GEN_MEMB_FUNC_VARIANT(const);
+GEN_MEMB_FUNC_VARIANT(&);
+GEN_MEMB_FUNC_VARIANT(&&);
+GEN_MEMB_FUNC_VARIANT(const &);
+GEN_MEMB_FUNC_VARIANT(const &&);
+GEN_MEMB_FUNC_VARIANT(noexcept);
+GEN_MEMB_FUNC_VARIANT(const noexcept);
+GEN_MEMB_FUNC_VARIANT(& noexcept);
+GEN_MEMB_FUNC_VARIANT(&& noexcept);
+GEN_MEMB_FUNC_VARIANT(const & noexcept);
+GEN_MEMB_FUNC_VARIANT(const && noexcept);
+#undef GEN_MEMB_FUNC_VARIANT
 
 template<typename ... Args>
 struct ctor_ref {};
@@ -139,14 +178,135 @@ struct cpp_func_traits<ctor_ref<Args...>, ArgNames>
     using ret_type = void;
 };
 
+template<typename T, std::nullptr_t = nullptr>
+struct remove_ref_wrapper {
+    using type = T;
+};
+template<typename T>
+struct remove_ref_wrapper<std::reference_wrapper<T>> {
+    using type = T;
+};
+template<typename T>
+using remove_ref_wrapper_t = typename remove_ref_wrapper<T>::type;
+
 template<typename C /* subclass of PHPClass */>
 class PHPClass;
 
-template<zend_type T>
-struct zval_typed : zval {
-    constexpr static zend_type z_type = T;
-    // TODO add class optional template parameter for arginfo
+enum class ztype : zend_type {
+    UNDEF_T = IS_UNDEF,
+    NULL_T = IS_NULL,
+    FALSE_T = IS_FALSE,
+    TRUE_T = IS_TRUE,
+    LONG_T = IS_LONG,
+    DOUBLE_T = IS_DOUBLE,
+    STRING_T = IS_STRING,
+    ARRAY_T = IS_ARRAY,
+    OBJECT_T = IS_OBJECT,
+    RESOURCE_T = IS_RESOURCE,
+    REFERENCE_T = IS_REFERENCE
 };
+
+template<ztype _type>
+class zval_typed : public zval {
+public:
+    struct uninitialized_t {};
+    constexpr static auto uninit = uninitialized_t{};
+    explicit zval_typed(uninitialized_t) {
+        ZVAL_UNDEF(this);
+    }
+    explicit zval_typed(const zval &zv) : zval{zv} {
+        assert(Z_TYPE(zv) == static_cast<int>(_type));
+    }
+    explicit zval_typed(zval &&zv) : zval{std::move(zv)} {
+        assert(Z_TYPE(zv) == static_cast<int>(_type));
+        ZVAL_UNDEF(&zv);
+    }
+    explicit zval_typed(const zval_typed<_type> &tzv)
+        : zval_typed{static_cast<const zval &>(tzv)} {}
+    explicit zval_typed(zval_typed<_type> &&zvt)
+        : zval_typed{static_cast<zval &&>(zvt)} {}
+
+    // we don't implicit manage calls to dtor
+    // because the purpose of these objects is to be passed
+    // further along to the engine as plain zvals.
+    // To keep things consistent, we don't manage calls to
+    // add_ref/copy_ctor neither
+    void add_ref() noexcept {
+        Z_TRY_ADDREF_P(this);
+    }
+    // copy_ctor only matters for arrays, so add it there
+
+    void zv_dtor() noexcept {
+        zval_ptr_dtor_nogc(this);
+    }
+//    operator zvalu&() { return *static_cast<zvalu*>(this); }
+
+    static constexpr ztype type() noexcept {
+        return _type;
+    }
+
+protected:
+    zval_typed() {}
+};
+
+class zval_s : public zval_typed<ztype::STRING_T> {
+public:
+    zval_s(uninitialized_t) : zval_typed<ztype::STRING_T>{uninit} {}
+    zval_s(zend_string *zs) {
+        ZVAL_STR(this, zs);
+    }
+
+    void operator=(zend_string *zs) {
+        zval_dtor(this);
+        ZVAL_STR(this, zs);
+    }
+    zstring_view val() const {
+        return Z_STR_P(this);
+    }
+protected:
+    zval_s() {}
+};
+
+class zval_l : public zval_typed<ztype::LONG_T> {
+public:
+    zval_l(uninitialized_t) : zval_typed<ztype::LONG_T>{uninit} {}
+    zval_l(zend_long l) {
+        ZVAL_LONG(this, l)
+    }
+    zend_long val() {
+        return Z_LVAL_P(this);
+    }
+    void operator=(zend_long l) {
+        Z_LVAL_P(this) = l;
+    }
+protected:
+    zval_l() {}
+};
+static_assert(std::is_standard_layout_v<zval_l>);
+
+template<typename C>
+class zval_o : public zval_typed<ztype::OBJECT_T> {
+public:
+    using nat_class_t = C;
+
+    zval_o(uninitialized_t) : zval_typed<ztype::OBJECT_T>{uninit} {}
+    zval_o(typename C::zobj_t *zobj) {
+        ZVAL_OBJ(this, &zobj->parent);
+    }
+    static zval_o create_unconstructed() {
+        zval_o zv{};
+        object_init_ex(&zv, C::ce);
+        return zv;
+    }
+
+    C& val() const {
+        return *C::fetch_nat_obj(this);
+    }
+protected:
+    zval_o() {}
+};
+template<typename Z>
+zval_o(Z *zobj) -> zval_o<std::decay_t<decltype(*zobj->nat_obj)>>;
 
 /**** TO zval ****/
 namespace zval_conversions {
@@ -165,19 +325,16 @@ namespace zval_conversions {
 
 
     static auto to_zval(int i) {
-        zval_typed<IS_LONG> zv;
-        ZVAL_LONG(&zv, static_cast<zend_long>(i))
+        zval_l zv{static_cast<zend_long>(i)};
         return zv;
     }
     static auto to_zval(long i) {
-        zval_typed<IS_LONG> zv;
-        ZVAL_LONG(&zv, static_cast<zend_long>(i))
+        zval_l zv{static_cast<zend_long>(i)};
         return zv;
     }
 
     template<typename C>
-    static auto to_zval(const PHPClass<C> &cc) {
-        zval_typed<IS_OBJECT> zv;
+    static zval_o<C> to_zval(const PHPClass<C> &cc) {
         if (cc.state == C::state::UNCONSTRUCTED ||
             cc.state == C::state::DESTRUCTED) {
                 zmm::string msg;
@@ -188,43 +345,83 @@ namespace zval_conversions {
         }
         if (cc.zobj_self) {
             zend_object *zobj = cc.zobj_self;
-            ZVAL_OBJ(&zv, zobj);
-            zval_add_ref(&zv);
+            auto zv = zval_o{C::fetch_zobj(zobj)};
+            zv.add_ref();
+            return zv;
         } else {
             if (cc.state != C::state::UNBOUND) {
                 throw error_to{"object not included in PHP variable is not in "
                                "the UNBOUND state"};
             } else {
                 if constexpr(std::is_copy_constructible_v<C>) {
-                    object_init_ex(&zv, C::ce);
+                    auto zv = zval_o<C>::create_unconstructed();
                     using zobj_t = typename C::zobj_t;
                     zobj_t *zobj_sub = C::fetch_zobj(&zv);
                     C *c = zobj_sub->nat_obj;
-                    new(c) C(*zobj_sub->nat_obj); // call copy ctor
+                    new(c) C(static_cast<const C&>(cc)); // call copy ctor
                     c->identify_owning_zobj(&zobj_sub->parent);
                     // TODO: option to do move instead of copy
+                    return zv;
                 } else {
-                    throw error_to{
-                            "Cannot build PHP variable with native "
-                            "object built outside of PHP variable because its "
-                            "class is not copy constructible"};
+                    zmm::string m =
+                            "Cannot build PHP variable with native object "
+                            "built outside of PHP because its class ";
+                    m += C::get_php_class_name();
+                    m += " is not copy constructible";
+                    throw error_to{std::move(m)};
                 }
             }
         }
-        return zv;
+    }
+
+    template<typename C>
+    static zval_o<C> to_zval(PHPClass<C> &&cc) {
+        if constexpr (std::is_move_constructible_v<C>) {
+            if (cc.state == C::state::UNCONSTRUCTED ||
+                cc.state == C::state::DESTRUCTED) {
+                zmm::string msg;
+                msg += "Cannot wrap object of type ";
+                msg += ZSTR_VAL(C::ce->name);
+                msg += " in an unconstructed or destroyed state";
+                throw error_to{msg};
+            }
+
+            auto zv = zval_o<C>::create_unconstructed();
+            using zobj_t = typename C::zobj_t;
+            zobj_t *zobj_sub = C::fetch_zobj(&zv);
+            C *c = zobj_sub->nat_obj;
+            new (c) C(static_cast<C&&>(cc)); // call move ctor
+            c->identify_owning_zobj(&zobj_sub->parent);
+            // TODO: option to do move instead of copy
+            return zv;
+        } else {
+            if constexpr (std::is_copy_constructible_v<C>) {
+                return to_zval(static_cast<PHPClass<C> &>(cc));
+            } else {
+                zmm::string m = "Cannot build PHP variable with native object "
+                                "built outside of PHP because its class ";
+                m += C::get_php_class_name();
+                m += " is not copy or move constructible";
+                throw error_to{std::move(m)};
+            }
+        }
+    }
+
+    template<typename C>
+    static zval_o<C> to_zval(const std::reference_wrapper<C> &rw) {
+        return to_zval(rw.get());
     }
 }
 
 template<typename T>
 static auto convert_to_zval(T &&i) noexcept {
     using R = decltype(zval_conversions::to_zval(std::forward<T>(i)));
+    static_assert(std::is_base_of_v<zval, R>, "no valid conversion");
     try {
         return zval_conversions::to_zval(std::forward<T>(i));
     } catch (const zval_conversions::error_to& err) {
         zval_conversions::handle_error(err);
-        R z;
-        ZVAL_NULL(&z);
-        return z;
+        return R{R::uninit};
     }
 }
 
@@ -326,7 +523,8 @@ namespace zval_conversions {
     template<typename T /* type of bound arg */>
     static auto from_zval(zval &zv) { // not const because of the arg parse API
         using T_ = std::remove_cv_t<T>;
-        using T_nonref = std::decay_t<T_>;
+        using T_nonref = remove_ref_wrapper_t<std::decay_t<T_>>;
+
         /* type of value passed to from_zval */
         using C = std::conditional_t<
                 std::conjunction_v<
@@ -470,8 +668,9 @@ namespace zval_conversions {
 
     template<typename T>
     struct from_zval_c<T&> {
-        template<typename = std::enable_if_t<!std::is_class_v<T>>>
         static ref_arg<T> from_zval(zval &zv) {
+            // TODO: assertion probably should be limited to PHPClasses
+            static_assert(!std::is_class_v<T>, "unexpected use with classes");
             if (Z_TYPE(zv) != IS_REFERENCE) {
                 throw error_from_no_ctx{ZPP_ERROR_NO_REFERENCE};
             }
@@ -503,6 +702,7 @@ namespace zval_conversions {
         cvt_ptr(T *ptr) : ptr(ptr) {}
         mutable T *ptr;
         operator T&() const { return *ptr; }
+        operator std::reference_wrapper<T>() const { return std::ref(*ptr); }
     };
     template<typename T>
     cvt_ptr(T *ptr) -> cvt_ptr<T>;
@@ -612,6 +812,20 @@ class php_arginfo {
             : gen_info{arg_traits::min_args, 0, 0 /* TODO: ret by ref */, 0} {}
     };
 
+    // we need to generalize zend_internal_arg_info with a union because
+    // a cast of char * into zend_type (aka uintptr_r) is not allowed in
+    // constexpr code
+    struct zend_internal_arg_info_gen {
+        const char *name;
+        union type_union {
+            zend_type ztype;
+            const char *class_name;
+            constexpr type_union(zend_type ztype) : ztype(ztype) {}
+            constexpr type_union(const char *cname) : class_name(cname) {}
+        } type;
+        zend_uchar pass_by_reference;
+        zend_bool is_variadic;
+    };
 
     struct php_arginfo_agg_no_args : php_arg_info_base {
         static constexpr bool no_args = true;
@@ -623,7 +837,7 @@ class php_arginfo {
     struct php_arginfo_agg_with_args : php_arg_info_base {
         static constexpr bool no_args = false;
 
-        std::array<zend_internal_arg_info, arg_traits::max_args> arg_info;
+        std::array<zend_internal_arg_info_gen, arg_traits::max_args> arg_info;
         zend_internal_arg_info terminator;
 
         constexpr php_arginfo_agg_with_args() noexcept
@@ -647,28 +861,64 @@ class php_arginfo {
                 std::make_index_sequence<arg_traits::max_args>{});
         static constexpr auto expl_param_names = FT::arg_names::array;
 
+        /* create optional hint for classes: ?<class name> */
+        template<char ... C>
+        struct hint_for_opt_cls_holder {
+            constexpr static const char value[] { '?', C..., 0 };
+        };
+        template<char ... Cs>
+        static constexpr auto
+        create_hint_for_opt_cls(ct_string<char, Cs...>) {
+            return hint_for_opt_cls_holder<Cs...>::value;
+        }
+
         template<size_t i>
         static constexpr auto to_zend_internal_arg_info() {
             using arg_type = typename arg_traits::template elem_base_type<i>;
             constexpr auto num_prov_arg_names = FT::arg_names::size;
-            auto is_opt = arg_traits::template is_elem_optional_v<i>;
-            auto arg_ztype = decltype(convert_to_zval(
-                    std::declval<arg_type>()))::z_type;
-            auto is_ref = arg_traits::template is_elem_ref_v<i> &&
-                          arg_ztype != IS_OBJECT;
-            const char *arg_name = [&]() {
+            constexpr auto is_opt = arg_traits::template is_elem_optional_v<i>;
+            using conv_type = decltype(convert_to_zval(
+                    std::declval<arg_type>()));
+            // TODO: refs for classes
+            constexpr auto is_ref = arg_traits::template is_elem_ref_v<i> &&
+                          conv_type::type() != ztype::OBJECT_T;
+            constexpr const char *arg_name = [&]() {
                 if constexpr (i < num_prov_arg_names) {
                     return expl_param_names[i];
                 } else {
                     return auto_param_names[i].data();
                 }
             }();
-            return zend_internal_arg_info{
-                    arg_name,
-                    ZEND_TYPE_ENCODE(arg_ztype, is_opt),
-                    is_ref,
-                    0,                       /* TODO: variadic */
-            };
+
+            if constexpr (conv_type::type() == ztype::OBJECT_T) {
+                constexpr auto cname = // decltype to avoid decay
+                        conv_type::nat_class_t::get_php_class_name();
+                constexpr const char *hint = [&]() -> const char * {
+                    if constexpr (is_opt) {
+                        return create_hint_for_opt_cls(cname);
+                    } else {
+                        return cname;
+                    }
+                }();
+
+                constexpr auto r = zend_internal_arg_info_gen{
+                        arg_name,
+                        hint,
+                        0,     // TODO: refs for classes
+                        0      // TODO: variadic
+                };
+                return r;
+            } else {
+                constexpr auto r = zend_internal_arg_info_gen{
+                        arg_name,
+                        ZEND_TYPE_ENCODE(
+                                static_cast<zend_type>(conv_type::type()),
+                                is_opt),
+                        is_ref,
+                        0, // TODO: variadic
+                };
+                return r;
+            }
         }
 
         template<size_t... Is>
@@ -685,7 +935,7 @@ public:
 
 static_assert((php_arginfo<cpp_func_traits<void (*)(std::optional<int>)>>::type{})
                               .arg_info[0]
-                              .type == ZEND_TYPE_ENCODE(IS_LONG, 1),
+                              .type.ztype == ZEND_TYPE_ENCODE(IS_LONG, 1),
               "php_arginfo should be statically instantiable");
 static_assert((php_arginfo<cpp_func_traits<void (*)()>>::type{}).gen_info.required_num_args == 0,
               "php_arginfo should be statically instantiable (0 args)");
@@ -709,7 +959,8 @@ public:
 
 /* C++17: replaceable with std::apply? */
 template<typename F, typename T, size_t... Is>
-static decltype(auto) call_tuple(F f, const T &tuple, std::index_sequence<Is...>) {
+static decltype(auto) call_tuple(F f, const T &tuple,
+                                 std::index_sequence<Is...>) {
     return f(std::get<Is>(tuple)...);
 }
 
@@ -720,7 +971,7 @@ static decltype(auto) call_tuple(F f, const T &t) {
 }
 
 template<typename FT, typename FT::func_type func>
-static zif_handler wrap_non_inst_meth() {
+static inline zif_handler wrap_free_function() {
     zif_handler wrapped = [](INTERNAL_FUNCTION_PARAMETERS) -> void {
         using arg_traits = typename FT::arg_traits;
         constexpr auto max_params = arg_traits::max_args;
@@ -751,6 +1002,4 @@ static zif_handler wrap_non_inst_meth() {
     };
     return wrapped;
 }
-
-
 }

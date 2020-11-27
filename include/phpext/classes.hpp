@@ -4,53 +4,61 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
-#include <cxxabi.h>
 #include <Zend/zend_exceptions.h>
 #include "conversions.hpp"
 
 namespace zend {
 
-template<typename C /* subclass of PHPClass */>
-class PHPClass {
+struct PHPObjectStateEmpty {};
+class PHPObjectState {
 public:
-    template<const char * ... Names>
-    using arg_names = zend::arg_names<Names...>;
-
-    PHPClass() noexcept : state(state::UNBOUND) {
-        // invoking the constructor via the PHP __construct
-        // will then set this to VALID
-    }
-
-    // PHPClass(const PHPClass<C>&) = delete;
-    PHPClass(const PHPClass<C> &) noexcept
-        : state{state::UNBOUND}, zobj_self{nullptr} {
-    }
-    PHPClass& operator=(const PHPClass&) = delete;
-
-    ~PHPClass() {
-        state = state::DESTRUCTED;
-        zobj_self = nullptr;
-    }
-
-    static inline zend_class_entry *ce;
-private:
-
+    enum class state : uint8_t { UNBOUND, UNCONSTRUCTED, VALID, DESTRUCTED };
     static constexpr auto state_names = std::array<const char *const, 4>{
         "UNBOUND", // not associated to a PHP object
         "UNCONSTRUCTED",
         "VALID", // storage resides in zend_object
         "DESTRUCTED"
     };
-    enum class state : uint8_t {
-        UNBOUND,
-        UNCONSTRUCTED,
-        VALID,
-        DESTRUCTED
-    };
+
+    PHPObjectState() noexcept : state{state::UNBOUND}, zobj_self{nullptr} {}
+
+    PHPObjectState(zend_object *zobj) noexcept
+        : state(state::UNCONSTRUCTED), zobj_self{zobj} {}
+
+    PHPObjectState(state state, zend_object *zobj) noexcept
+        : state{state}, zobj_self{zobj} {}
+
+    ~PHPObjectState() {
+        state = state::DESTRUCTED;
+        zobj_self = nullptr;
+    }
+
     state state;
     zend_object *zobj_self; // set iif UNCONSTRUCTED/VALID
+};
 
+template<typename C /* subclass of PHPClass */>
+class PHPClass : protected PHPObjectState {
+public:
+    template<const char * ... Names>
+    using arg_names = zend::arg_names<Names...>;
+
+    PHPClass() noexcept {}
+    explicit PHPClass(zend_object *zobj) noexcept : PHPObjectState{zobj} {}
+    PHPClass(const PHPClass<C> &) noexcept
+        : PHPObjectState{state::UNBOUND, nullptr} {}
+
+    PHPClass(PHPClass<C> &&) = delete;
+    PHPClass& operator=(const PHPClass&) = delete;
+
+    constexpr static auto& get_php_class_name() {
+        return C::php_class_name;
+    }
+
+    static inline zend_class_entry *ce;
+private:
     // after building with object_init_ex and calling a constructor
     void identify_owning_zobj(zend_object *zobj) noexcept {
         assert(state == state::UNBOUND);
@@ -70,8 +78,7 @@ private:
         zend_object_std_init(&zobj->parent, obj_ce);
         zobj->parent.handlers = &handlers;
         zobj->nat_obj = static_cast<C *>(emalloc(sizeof *zobj->nat_obj));
-        zobj->nat_obj->state = state::UNCONSTRUCTED;
-        zobj->nat_obj->zobj_self = &zobj->parent;
+        new (zobj->nat_obj) PHPClass<C>(&zobj->parent);
 
         return &zobj->parent;
     }
@@ -97,28 +104,6 @@ private:
         return fetch_zobj(zv)->nat_obj;
     }
 
-    template<typename, typename = void>
-    struct HasPhpClassName : std::false_type {};
-    template<typename T>
-    struct HasPhpClassName<T, decltype((void)T::php_class_name)> : std::true_type {};
-
-    template<typename T>
-    static std::enable_if_t<!HasPhpClassName<T>::value, std::string>
-    get_class_name() noexcept {
-        auto name = typeid(T).name();
-        int status = -1;
-        std::unique_ptr<char, void (*)(void*)> res{
-            abi::__cxa_demangle(name, nullptr, nullptr, &status),
-            std::free
-        };
-        return status == 0 ? res.get() : name;
-    }
-    template<typename T>
-    static std::enable_if_t<HasPhpClassName<T>::value, std::string>
-    get_class_name() noexcept {
-        return T::php_class_name;
-    }
-
     template<typename T>
     struct ret_void : std::false_type {};
     template<typename ... Args>
@@ -142,6 +127,7 @@ private:
             }
 
             C *c;
+            zobj_t *zobj;
             if constexpr (is_inst_meth) {
                 zval *this_zv = getThis();
                 if (!this_zv) {
@@ -150,7 +136,7 @@ private:
                             "Instance method called statically");
                     return;
                 }
-                zobj_t *zobj = C::fetch_zobj(this_zv);
+                zobj = C::fetch_zobj(this_zv);
                 c = zobj->nat_obj;
                 constexpr enum state expected_state =
                         is_ctor ? state::UNCONSTRUCTED : state::VALID;
@@ -158,8 +144,7 @@ private:
                     zend_throw_exception_ex(
                             zend_ce_exception, 0,
                             "Expected the object to have been in the state %s, "
-                            "but "
-                            "it's in state %s",
+                            "but it's in state %s",
                             state_names[static_cast<size_t>(expected_state)],
                             state_names[static_cast<size_t>(c->state)]);
                     return;
@@ -188,15 +173,19 @@ private:
                 }
             };
 
-            using R = typename FT::ret_type;
             if constexpr (is_ctor || FT::is_void::value) {
                 call_tuple(f_this, tuple_conv_args);
                 if constexpr (is_ctor) {
                     c->state = state::VALID;
+                    // restore. The constructor call resets it to null
+                    c->zobj_self = &zobj->parent; 
                 }
             } else {
-                R res = call_tuple(f_this, tuple_conv_args);
-                *return_value = convert_to_zval(res);
+                decltype(auto) res = call_tuple(f_this, tuple_conv_args);
+                static_assert(
+                        std::is_same_v<typename FT::ret_type, decltype(res)>);
+                *return_value =
+                        convert_to_zval(std::forward<decltype(res)>(res));
             }
         };
         return wrapped;
@@ -235,7 +224,7 @@ protected:
 
     template<typename AT, typename A = arg_names_empty_t>
     static void reg_constructor(AccFlags flags = AccFlags::PUBLIC) {
-        using func_traits = cpp_func_traits<typename AT::ctor_ref_of>;
+        using func_traits = cpp_func_traits<typename AT::ctor_ref_of, A>;
         auto wrapped_func = wrap_constructor<func_traits>();
         const auto arginfo = php_arg_info_holder<func_traits>::as_ziai_array();
         functions.push_back(
@@ -275,8 +264,8 @@ public:
           zend_class_entry temp_ce;
           C::register_php_methods();
           functions.emplace_back();
-          std::string class_name = get_class_name<C>();
-          INIT_CLASS_ENTRY_EX(temp_ce, class_name.data(), class_name.size(),
+          auto& cname = C::php_class_name;
+          INIT_CLASS_ENTRY_EX(temp_ce, cname, cname.length(),
                               functions.data())
           ce = zend_register_internal_class(&temp_ce);
         }
@@ -285,10 +274,10 @@ public:
         ce->create_object = ce_create_object;
     }
 
-    friend auto zval_conversions::to_zval(const PHPClass<C> &cc);
+    friend zval_o<C> zval_conversions::to_zval(const PHPClass<C> &);
+    friend zval_o<C> zval_conversions::to_zval(PHPClass<C> &&);
     friend struct zval_conversions::from_zval_c<zval_conversions::subclasses<C&>, void>;
     friend struct php_arginfo_agg_with_args;
-
+    friend class zval_o<C>;
 };
-
 }
